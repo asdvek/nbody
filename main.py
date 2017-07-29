@@ -13,21 +13,21 @@ masses = []
 
 # opencl kernel source
 # coords = coordinates of all particles
+# velocs = velocities of all particles
 # masses = masses of all particles
 # n = number of particles
-# results = resultant forces on all particles
 source = \
 """
-__kernel void compute_force(__global const float4* coords, __global const float* masses, const int n,
-   __global float4* results) 
+__kernel void compute_force(__global float4* coords, __global float4* velocs,
+__global const float* masses, const int n)
 {
     int gid = get_global_id(0);
 
+    // calculate force on particle due to all other particles
     const float G = 0.0001;
     const float4 s1 = (float4)(coords[gid].x, coords[gid].y, coords[gid].z, 0);
     const float m1 = masses[gid];
     float4 F = (float4)(0, 0, 0, 0);
-
     for (int i = 0; i < n; i++)
     {
         if (i == gid) continue;
@@ -36,7 +36,12 @@ __kernel void compute_force(__global const float4* coords, __global const float*
         float4 disp = s2 - s1;
         F += G*m1*m2*fast_normalize(disp)/pow(fast_length(disp)+0.001f, 1);
     }
-    results[gid] = F;
+
+    // update coords and velocs of the current particle using Euler's method
+    const float dt = 0.01;
+    float4 a = F/masses[gid];
+    velocs[gid] += a*dt;
+    coords[gid] += velocs[gid]*dt;
 }
 """
 
@@ -94,27 +99,20 @@ def main():
             glVertex3f(coords[i][0], coords[i][1], coords[i][2])
         glEnd()
 
+    # buffer memory to GPU
+    coords_buf = cl.Buffer(context, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf = np.array(coords).astype(np.float32))
+    velocs_buf = cl.Buffer(context, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf = np.array(velocs).astype(np.float32))
+    masses_buf = cl.Buffer(context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf = np.array(masses).astype(np.float32))
+
     # main loop
     frame_index = 0
     while (True):
         pyglet.clock.tick()
 
-        # buffer memory to GPU
-        coords_buf = cl.Buffer(context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf = np.array(coords).astype(np.float32))
-        masses_buf = cl.Buffer(context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf = np.array(masses).astype(np.float32))
-        results = np.zeros((n_bodies, 4), dtype=np.float32)
-        results_buf = cl.Buffer(context, mf.WRITE_ONLY, results.nbytes)
-
-        # compute forces and copy results to RAM
-        program.compute_force(queue, results.shape, None, coords_buf, masses_buf, np.int32(n_bodies), results_buf)
-        cl.enqueue_copy(queue, results, results_buf)
-
-        # update coordinates of particles using Euler's method with step size dt
-        dt = 0.01
-        for i in range(n_bodies):
-            a = results[i]/masses[i]
-            velocs[i] += a*dt
-            coords[i] += velocs[i]*dt
+        # compute new particle coordinates on GPU and copy them to coords for displaying
+        coords = np.empty_like(coords).astype(np.float32)
+        program.compute_force(queue, coords.shape, None, coords_buf, velocs_buf, masses_buf, np.int32(n_bodies))
+        cl.enqueue_copy(queue, coords, coords_buf)
 
         # refresh pyglet window
         for window in pyglet.app.windows:
